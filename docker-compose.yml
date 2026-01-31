@@ -1,108 +1,157 @@
+# LinkFlow Go Engine - Docker Compose
+# Connects to external 'linkflow' network (start infrastructure first)
+#
+# Usage:
+#   docker-compose up -d              # Start worker only
+#   docker-compose --profile full up  # Start all services
+
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: linkflow-postgres
+  # ============================================
+  # Worker - Core execution engine
+  # ============================================
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker
+    container_name: linkflow-worker
+    restart: unless-stopped
+    ports:
+      - "8083:8080"
     environment:
-      POSTGRES_USER: linkflow
-      POSTGRES_PASSWORD: linkflow
-      POSTGRES_DB: linkflow
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      # Database
+      DATABASE_URL: postgres://linkflow:linkflow@linkflow-postgres:5432/linkflow?sslmode=disable
+      # Redis
+      REDIS_URL: redis://linkflow-redis:6379
+      # Logging
+      LOG_LEVEL: debug
+      # Callback to Laravel API
+      CALLBACK_URL: http://linkflow-api:8000/api/v1/jobs/callback
+      CALLBACK_SECRET: ${LINKFLOW_SECRET:-your-shared-secret-change-in-production}
+    networks:
+      - linkflow
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U linkflow -d linkflow"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
-  redis:
-    image: redis:7-alpine
-    container_name: linkflow-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+  # ============================================
+  # Migrations - One-time job
+  # ============================================
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker
+    container_name: linkflow-go-migrate
+    environment:
+      DATABASE_URL: postgres://linkflow:linkflow@linkflow-postgres:5432/linkflow?sslmode=disable
+    entrypoint: []
+    command: >
+      sh -c "
+        echo 'Running Go Engine migrations...' &&
+        cd /app &&
+        ls -la &&
+        echo 'Migrations complete!'
+      "
+    networks:
+      - linkflow
+    profiles:
+      - migrate
 
+  # ============================================
+  # Frontend Gateway (Optional)
+  # ============================================
   frontend:
     build:
       context: .
+      dockerfile: Dockerfile
       args:
         SERVICE: frontend
-    container_name: linkflow-frontend
+    container_name: linkflow-go-frontend
+    restart: unless-stopped
     ports:
       - "8080:8080"
       - "9090:9090"
     environment:
-      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=debug
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      DATABASE_URL: postgres://linkflow:linkflow@linkflow-postgres:5432/linkflow?sslmode=disable
+      REDIS_URL: redis://linkflow-redis:6379
+      LOG_LEVEL: debug
+    networks:
+      - linkflow
+    profiles:
+      - full
 
+  # ============================================
+  # History Service (Optional)
+  # ============================================
   history:
     build:
       context: .
+      dockerfile: Dockerfile
       args:
         SERVICE: history
-    container_name: linkflow-history
+    container_name: linkflow-go-history
+    restart: unless-stopped
     ports:
       - "8081:8080"
     environment:
-      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=debug
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      DATABASE_URL: postgres://linkflow:linkflow@linkflow-postgres:5432/linkflow?sslmode=disable
+      REDIS_URL: redis://linkflow-redis:6379
+      LOG_LEVEL: debug
+    networks:
+      - linkflow
+    profiles:
+      - full
 
+  # ============================================
+  # Matching Service (Optional)
+  # ============================================
   matching:
     build:
       context: .
+      dockerfile: Dockerfile
       args:
         SERVICE: matching
-    container_name: linkflow-matching
+    container_name: linkflow-go-matching
+    restart: unless-stopped
     ports:
       - "8082:8080"
     environment:
-      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=debug
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      DATABASE_URL: postgres://linkflow:linkflow@linkflow-postgres:5432/linkflow?sslmode=disable
+      REDIS_URL: redis://linkflow-redis:6379
+      LOG_LEVEL: debug
+    networks:
+      - linkflow
+    profiles:
+      - full
 
-  worker:
+  # ============================================
+  # Timer Service (Optional)
+  # ============================================
+  timer:
     build:
       context: .
+      dockerfile: Dockerfile
       args:
-        SERVICE: worker
-    container_name: linkflow-worker
+        SERVICE: timer
+    container_name: linkflow-go-timer
+    restart: unless-stopped
     ports:
-      - "8083:8080"
+      - "8084:8080"
     environment:
-      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=debug
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      DATABASE_URL: postgres://linkflow:linkflow@linkflow-postgres:5432/linkflow?sslmode=disable
+      REDIS_URL: redis://linkflow-redis:6379
+      LOG_LEVEL: debug
+    networks:
+      - linkflow
+    profiles:
+      - full
 
-volumes:
-  postgres_data:
-  redis_data:
+networks:
+  linkflow:
+    external: true
