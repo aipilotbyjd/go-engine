@@ -22,6 +22,7 @@
 16. [Edge Execution](#16-edge-execution)
 17. [Database Schema](#17-database-schema)
 18. [Message Formats](#18-message-formats)
+    - [18.5 Laravel Integration](#185-laravel-integration)
 19. [API Specifications](#19-api-specifications)
 20. [Deployment](#20-deployment)
 21. [Performance Targets](#21-performance-targets)
@@ -4209,6 +4210,189 @@ message Failure {
     string stack_trace = 3;
 }
 ```
+
+### 18.5 Laravel Integration
+
+The Engine communicates with Laravel through two mechanisms:
+1. **Inbound API**: Laravel calls the Engine to start/query/control workflows
+2. **Outbound Callbacks**: Engine calls Laravel to report execution events
+
+#### Callback Architecture
+```
+┌─────────────────┐                           ┌─────────────────┐
+│                 │  1. Start Workflow        │                 │
+│   Laravel API   │ ─────────────────────────►│   Go Engine     │
+│                 │                           │                 │
+│                 │  2. Callbacks:            │                 │
+│   /api/engine/  │ ◄─────────────────────────│   execution.*   │
+│   callback      │     - execution.started   │   node.*        │
+│                 │     - execution.completed │                 │
+│                 │     - execution.failed    │                 │
+│                 │     - node.completed      │                 │
+└─────────────────┘     - node.failed         └─────────────────┘
+```
+
+#### Callback Client
+```go
+// internal/callback/client.go
+package callback
+
+// CallbackPayload is the payload sent to Laravel
+type CallbackPayload struct {
+    Event       EventType              `json:"event"`
+    Timestamp   time.Time              `json:"timestamp"`
+    WorkspaceID string                 `json:"workspace_id"`
+    WorkflowID  string                 `json:"workflow_id"`
+    ExecutionID string                 `json:"execution_id"`
+    RunID       string                 `json:"run_id"`
+    Data        map[string]interface{} `json:"data,omitempty"`
+}
+
+// Event types
+const (
+    EventTypeExecutionStarted   = "execution.started"
+    EventTypeExecutionCompleted = "execution.completed"
+    EventTypeExecutionFailed    = "execution.failed"
+    EventTypeNodeStarted        = "node.started"
+    EventTypeNodeCompleted      = "node.completed"
+    EventTypeNodeFailed         = "node.failed"
+)
+
+// Client sends callbacks to Laravel
+type Client struct {
+    httpClient *http.Client
+    secretKey  string // For HMAC signing
+}
+
+// Send sends a callback with HMAC signature
+func (c *Client) Send(ctx context.Context, callbackURL string, payload *CallbackPayload) error {
+    body, _ := json.Marshal(payload)
+    
+    req, _ := http.NewRequestWithContext(ctx, "POST", callbackURL, bytes.NewReader(body))
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-LinkFlow-Event", string(payload.Event))
+    req.Header.Set("X-LinkFlow-Signature", c.sign(body))
+    
+    resp, err := c.httpClient.Do(req)
+    // Handle response...
+    return err
+}
+
+func (c *Client) sign(payload []byte) string {
+    h := hmac.New(sha256.New, []byte(c.secretKey))
+    h.Write(payload)
+    return hex.EncodeToString(h.Sum(nil))
+}
+```
+
+#### HTTP API Handler
+```go
+// internal/frontend/handler/http.go
+package handler
+
+// HTTPHandler provides REST endpoints for Laravel
+type HTTPHandler struct {
+    service *frontend.Service
+}
+
+// RegisterRoutes registers HTTP routes
+func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
+    mux.HandleFunc("POST /api/v1/workflows/execute", h.StartWorkflow)
+    mux.HandleFunc("GET /api/v1/workspaces/{workspace_id}/executions/{execution_id}", h.GetExecution)
+    mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/cancel", h.CancelExecution)
+    mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/signal", h.SendSignal)
+    mux.HandleFunc("GET /health", h.Health)
+}
+
+// StartWorkflowRequest from Laravel
+type StartWorkflowRequest struct {
+    WorkspaceID    string                 `json:"workspace_id"`
+    WorkflowID     string                 `json:"workflow_id"`
+    ExecutionID    string                 `json:"execution_id,omitempty"`
+    IdempotencyKey string                 `json:"idempotency_key,omitempty"`
+    Input          map[string]interface{} `json:"input"`
+    CallbackURL    string                 `json:"callback_url,omitempty"`
+}
+```
+
+#### Laravel Client Example
+```php
+// app/Services/Engine/LinkFlowClient.php
+class LinkFlowClient
+{
+    public function startWorkflow(
+        string $workspaceId,
+        string $workflowId,
+        array $input = [],
+        ?string $callbackUrl = null
+    ): array {
+        $response = Http::post("{$this->baseUrl}/api/v1/workflows/execute", [
+            'workspace_id' => $workspaceId,
+            'workflow_id' => $workflowId,
+            'execution_id' => (string) Str::uuid(),
+            'input' => $input,
+            'callback_url' => $callbackUrl ?? route('engine.callback'),
+        ]);
+        
+        return $response->json();
+    }
+    
+    public function getExecution(string $workspaceId, string $executionId): array
+    {
+        return Http::get(
+            "{$this->baseUrl}/api/v1/workspaces/{$workspaceId}/executions/{$executionId}"
+        )->json();
+    }
+}
+```
+
+#### Laravel Callback Handler
+```php
+// app/Http/Controllers/Engine/EngineCallbackController.php
+class EngineCallbackController extends Controller
+{
+    public function handle(Request $request)
+    {
+        // Verify HMAC signature
+        $this->verifySignature($request);
+        
+        $event = $request->header('X-LinkFlow-Event');
+        $payload = $request->all();
+        
+        match ($event) {
+            'execution.started' => $this->handleStarted($payload),
+            'execution.completed' => $this->handleCompleted($payload),
+            'execution.failed' => $this->handleFailed($payload),
+            'node.completed' => $this->handleNodeCompleted($payload),
+            default => null,
+        };
+        
+        return response()->json(['status' => 'ok']);
+    }
+    
+    protected function verifySignature(Request $request): void
+    {
+        $signature = $request->header('X-LinkFlow-Signature');
+        $expected = hash_hmac('sha256', $request->getContent(), config('services.linkflow.secret'));
+        
+        if (!hash_equals($expected, $signature ?? '')) {
+            abort(401, 'Invalid callback signature');
+        }
+    }
+}
+```
+
+#### Environment Configuration
+```env
+# Laravel .env
+LINKFLOW_ENGINE_URL=http://engine:7233
+LINKFLOW_ENGINE_SECRET=your-shared-secret-key
+
+# Go Engine environment
+CALLBACK_SECRET=your-shared-secret-key
+LARAVEL_CALLBACK_URL=http://api/api/engine/callback
+```
+
 ---
 ## 19. API Specifications
 ### 19.1 gRPC Service Definitions
