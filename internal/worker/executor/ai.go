@@ -66,11 +66,22 @@ type AIUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// NewAIExecutor creates a new AI executor
+// NewAIExecutor creates a new AI executor with connection pooling
 func NewAIExecutor() *AIExecutor {
+	// Configure transport with connection pooling for better performance
+	transport := &http.Transport{
+		MaxIdleConns:        50,                // AI calls typically to fewer hosts
+		MaxIdleConnsPerHost: 10,                // Keep connections warm to OpenAI/Anthropic
+		MaxConnsPerHost:     20,                // Limit concurrent connections per host
+		IdleConnTimeout:     120 * time.Second, // Longer idle for AI since calls are slow
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return &AIExecutor{
 		client: &http.Client{
-			Timeout: 120 * time.Second, // AI calls can be slow
+			Timeout:   120 * time.Second, // AI calls can be slow
+			Transport: transport,
 		},
 	}
 }

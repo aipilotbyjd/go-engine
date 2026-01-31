@@ -28,10 +28,22 @@ type HTTPResponse struct {
 	Body       json.RawMessage   `json:"body"`
 }
 
+// NewHTTPExecutor creates a new HTTP executor with connection pooling
 func NewHTTPExecutor() *HTTPExecutor {
+	// Configure transport with connection pooling for better performance
+	transport := &http.Transport{
+		MaxIdleConns:        100,              // Max idle connections across all hosts
+		MaxIdleConnsPerHost: 20,               // Max idle connections per host
+		MaxConnsPerHost:     50,               // Max total connections per host
+		IdleConnTimeout:     90 * time.Second, // How long idle connections stay in pool
+		DisableCompression:  false,            // Enable compression
+		ForceAttemptHTTP2:   true,             // Prefer HTTP/2 when available
+	}
+
 	return &HTTPExecutor{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 	}
 }

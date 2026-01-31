@@ -96,11 +96,22 @@ type SlackMessageResp struct {
 	Timestamp string `json:"ts"`
 }
 
-// NewSlackExecutor creates a new Slack executor
+// NewSlackExecutor creates a new Slack executor with connection pooling
 func NewSlackExecutor() *SlackExecutor {
+	// Configure transport with connection pooling for better performance
+	transport := &http.Transport{
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 10, // Most calls to slack.com
+		MaxConnsPerHost:     20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return &SlackExecutor{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 	}
 }

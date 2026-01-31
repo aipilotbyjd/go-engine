@@ -63,11 +63,22 @@ type WebhookResponse struct {
 	Duration      string            `json:"duration"`
 }
 
-// NewWebhookExecutor creates a new webhook executor
+// NewWebhookExecutor creates a new webhook executor with connection pooling
 func NewWebhookExecutor() *WebhookExecutor {
+	// Configure transport with connection pooling for better performance
+	transport := &http.Transport{
+		MaxIdleConns:        100, // Webhooks can hit many different hosts
+		MaxIdleConnsPerHost: 10,  // Keep some connections warm per host
+		MaxConnsPerHost:     20,  // Limit concurrent connections
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return &WebhookExecutor{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 10 {
 					return fmt.Errorf("stopped after 10 redirects")

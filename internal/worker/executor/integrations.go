@@ -66,11 +66,22 @@ type DiscordEmbedMedia struct {
 	URL string `json:"url"`
 }
 
-// NewDiscordExecutor creates a new Discord executor
+// NewDiscordExecutor creates a new Discord executor with connection pooling
 func NewDiscordExecutor() *DiscordExecutor {
+	// Configure transport with connection pooling
+	transport := &http.Transport{
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 10,
+		MaxConnsPerHost:     20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return &DiscordExecutor{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 	}
 }
@@ -233,11 +244,22 @@ type TwilioConfig struct {
 	MediaURL   string `json:"media_url"`
 }
 
-// NewTwilioExecutor creates a new Twilio executor
+// NewTwilioExecutor creates a new Twilio executor with connection pooling
 func NewTwilioExecutor() *TwilioExecutor {
+	// Configure transport with connection pooling for Twilio API
+	transport := &http.Transport{
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 10, // Most calls to api.twilio.com
+		MaxConnsPerHost:     20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return &TwilioExecutor{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 	}
 }
