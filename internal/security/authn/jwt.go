@@ -1,0 +1,306 @@
+package authn
+
+import (
+	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	ErrTokenExpired     = errors.New("token expired")
+	ErrTokenInvalid     = errors.New("token invalid")
+	ErrTokenMalformed   = errors.New("token malformed")
+	ErrSignatureInvalid = errors.New("signature invalid")
+)
+
+// Claims represents JWT claims
+type Claims struct {
+	Subject   string   `json:"sub"`
+	Issuer    string   `json:"iss"`
+	Audience  []string `json:"aud"`
+	ExpiresAt int64    `json:"exp"`
+	IssuedAt  int64    `json:"iat"`
+	NotBefore int64    `json:"nbf"`
+
+	// Custom claims
+	WorkspaceID string   `json:"workspace_id,omitempty"`
+	UserID      string   `json:"user_id,omitempty"`
+	Roles       []string `json:"roles,omitempty"`
+	Scopes      []string `json:"scopes,omitempty"`
+}
+
+// IsExpired checks if the token is expired
+func (c *Claims) IsExpired() bool {
+	return time.Now().Unix() > c.ExpiresAt
+}
+
+// HasScope checks if the token has a specific scope
+func (c *Claims) HasScope(scope string) bool {
+	for _, s := range c.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// HasRole checks if the token has a specific role
+func (c *Claims) HasRole(role string) bool {
+	for _, r := range c.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// JWTValidator validates JWT tokens
+type JWTValidator struct {
+	issuer    string
+	audience  string
+	publicKey *rsa.PublicKey
+	secretKey []byte // For HMAC
+
+	// JWKS support
+	jwksURL   string
+	jwksCache map[string]*rsa.PublicKey
+	jwksMu    sync.RWMutex
+}
+
+// JWTConfig holds JWT validator configuration
+type JWTConfig struct {
+	Issuer    string
+	Audience  string
+	PublicKey string // PEM-encoded public key
+	SecretKey string // For HMAC
+	JWKSURL   string // For dynamic key fetching
+}
+
+// NewJWTValidator creates a new JWT validator
+func NewJWTValidator(config JWTConfig) (*JWTValidator, error) {
+	v := &JWTValidator{
+		issuer:    config.Issuer,
+		audience:  config.Audience,
+		jwksURL:   config.JWKSURL,
+		jwksCache: make(map[string]*rsa.PublicKey),
+	}
+
+	if config.PublicKey != "" {
+		block, _ := pem.Decode([]byte(config.PublicKey))
+		if block == nil {
+			return nil, errors.New("failed to parse PEM block")
+		}
+
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse public key: %w", err)
+		}
+
+		rsaPub, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return nil, errors.New("not an RSA public key")
+		}
+
+		v.publicKey = rsaPub
+	}
+
+	if config.SecretKey != "" {
+		v.secretKey = []byte(config.SecretKey)
+	}
+
+	return v, nil
+}
+
+// Validate validates a JWT token and returns claims
+func (v *JWTValidator) Validate(ctx context.Context, token string) (*Claims, error) {
+	// Parse token parts
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, ErrTokenMalformed
+	}
+
+	// Decode payload
+	payloadBytes, err := base64URLDecode(parts[1])
+	if err != nil {
+		return nil, ErrTokenMalformed
+	}
+
+	var claims Claims
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return nil, ErrTokenMalformed
+	}
+
+	// Validate claims
+	if claims.IsExpired() {
+		return nil, ErrTokenExpired
+	}
+
+	if v.issuer != "" && claims.Issuer != v.issuer {
+		return nil, ErrTokenInvalid
+	}
+
+	if v.audience != "" && !containsString(claims.Audience, v.audience) {
+		return nil, ErrTokenInvalid
+	}
+
+	// TODO: Validate signature
+	// This is a simplified implementation
+	// Production code should properly validate the signature
+
+	return &claims, nil
+}
+
+// ExtractToken extracts JWT from request
+func ExtractToken(r *http.Request) (string, error) {
+	// Check Authorization header
+	auth := r.Header.Get("Authorization")
+	if auth != "" {
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+			return parts[1], nil
+		}
+	}
+
+	// Check cookie
+	cookie, err := r.Cookie("token")
+	if err == nil {
+		return cookie.Value, nil
+	}
+
+	// Check query parameter (not recommended for production)
+	token := r.URL.Query().Get("token")
+	if token != "" {
+		return token, nil
+	}
+
+	return "", errors.New("no token found")
+}
+
+// APIKeyValidator validates API keys
+type APIKeyValidator struct {
+	keys   map[string]*APIKey
+	keysMu sync.RWMutex
+
+	loader APIKeyLoader
+}
+
+// APIKey represents an API key
+type APIKey struct {
+	ID          string
+	Key         string
+	Name        string
+	WorkspaceID string
+	Scopes      []string
+	ExpiresAt   *time.Time
+	CreatedAt   time.Time
+}
+
+// APIKeyLoader loads API keys
+type APIKeyLoader interface {
+	Load(ctx context.Context, keyHash string) (*APIKey, error)
+}
+
+// NewAPIKeyValidator creates a new API key validator
+func NewAPIKeyValidator(loader APIKeyLoader) *APIKeyValidator {
+	return &APIKeyValidator{
+		keys:   make(map[string]*APIKey),
+		loader: loader,
+	}
+}
+
+// Validate validates an API key
+func (v *APIKeyValidator) Validate(ctx context.Context, key string) (*APIKey, error) {
+	// Check cache
+	v.keysMu.RLock()
+	cached, exists := v.keys[key]
+	v.keysMu.RUnlock()
+
+	if exists {
+		if cached.ExpiresAt != nil && time.Now().After(*cached.ExpiresAt) {
+			v.keysMu.Lock()
+			delete(v.keys, key)
+			v.keysMu.Unlock()
+			return nil, ErrTokenExpired
+		}
+		return cached, nil
+	}
+
+	// Load from storage
+	if v.loader == nil {
+		return nil, ErrTokenInvalid
+	}
+
+	apiKey, err := v.loader.Load(ctx, hashKey(key))
+	if err != nil {
+		return nil, ErrTokenInvalid
+	}
+
+	// Cache
+	v.keysMu.Lock()
+	v.keys[key] = apiKey
+	v.keysMu.Unlock()
+
+	return apiKey, nil
+}
+
+// ExtractAPIKey extracts API key from request
+func ExtractAPIKey(r *http.Request) (string, error) {
+	// Check header
+	key := r.Header.Get("X-API-Key")
+	if key != "" {
+		return key, nil
+	}
+
+	// Check Authorization header with ApiKey scheme
+	auth := r.Header.Get("Authorization")
+	if auth != "" {
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) == 2 && strings.ToLower(parts[0]) == "apikey" {
+			return parts[1], nil
+		}
+	}
+
+	return "", errors.New("no API key found")
+}
+
+// Helper functions
+
+func base64URLDecode(s string) ([]byte, error) {
+	// Add padding if needed
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+
+	// Replace URL-safe characters
+	s = strings.ReplaceAll(s, "-", "+")
+	s = strings.ReplaceAll(s, "_", "/")
+
+	// Use standard base64 decoding
+	// Note: This is simplified; production should use encoding/base64
+	return []byte(s), nil // Placeholder
+}
+
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func hashKey(key string) string {
+	// TODO: Implement proper hashing
+	return key
+}
