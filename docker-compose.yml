@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: linkflow-postgres
+    environment:
+      POSTGRES_USER: linkflow
+      POSTGRES_PASSWORD: linkflow
+      POSTGRES_DB: linkflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linkflow -d linkflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: linkflow-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: .
+      args:
+        SERVICE: frontend
+    container_name: linkflow-frontend
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  history:
+    build:
+      context: .
+      args:
+        SERVICE: history
+    container_name: linkflow-history
+    ports:
+      - "8081:8080"
+    environment:
+      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  matching:
+    build:
+      context: .
+      args:
+        SERVICE: matching
+    container_name: linkflow-matching
+    ports:
+      - "8082:8080"
+    environment:
+      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      args:
+        SERVICE: worker
+    container_name: linkflow-worker
+    ports:
+      - "8083:8080"
+    environment:
+      - DATABASE_URL=postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
