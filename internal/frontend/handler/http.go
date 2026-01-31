@@ -1,12 +1,18 @@
 package handler
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/linkflow/engine/internal/frontend"
+)
+
+const (
+	// MaxRequestBodySize limits request body to 1MB to prevent memory exhaustion
+	MaxRequestBodySize = 1 << 20 // 1 MB
 )
 
 // HTTPHandler provides HTTP endpoints for the Frontend service
@@ -26,19 +32,40 @@ func NewHTTPHandler(service *frontend.Service, logger *slog.Logger) *HTTPHandler
 
 // RegisterRoutes registers all HTTP routes
 func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
-	// Workflow execution endpoints
-	mux.HandleFunc("POST /api/v1/workflows/execute", h.StartWorkflow)
-	mux.HandleFunc("GET /api/v1/workspaces/{workspace_id}/executions/{execution_id}", h.GetExecution)
-	mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/cancel", h.CancelExecution)
-	mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/retry", h.RetryExecution)
-	mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/signal", h.SendSignal)
+	// Workflow execution endpoints - all wrapped with security middleware
+	mux.HandleFunc("POST /api/v1/workflows/execute", h.securityMiddleware(h.StartWorkflow))
+	mux.HandleFunc("GET /api/v1/workspaces/{workspace_id}/executions/{execution_id}", h.securityMiddleware(h.GetExecution))
+	mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/cancel", h.securityMiddleware(h.CancelExecution))
+	mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/retry", h.securityMiddleware(h.RetryExecution))
+	mux.HandleFunc("POST /api/v1/workspaces/{workspace_id}/executions/{execution_id}/signal", h.securityMiddleware(h.SendSignal))
 
 	// List executions
-	mux.HandleFunc("GET /api/v1/workspaces/{workspace_id}/executions", h.ListExecutions)
+	mux.HandleFunc("GET /api/v1/workspaces/{workspace_id}/executions", h.securityMiddleware(h.ListExecutions))
 
-	// Health check
+	// Health check (no security middleware needed for health endpoints)
 	mux.HandleFunc("GET /health", h.Health)
 	mux.HandleFunc("GET /ready", h.Ready)
+}
+
+// securityMiddleware adds security headers and request limits to handlers
+func (h *HTTPHandler) securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Set security headers
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// Limit request body size to prevent memory exhaustion attacks
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
+		}
+
+		next(w, r)
+	}
 }
 
 // StartWorkflowRequest is the request to start a workflow
@@ -67,7 +94,12 @@ func (h *HTTPHandler) StartWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	var req StartWorkflowRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		// Handle MaxBytesReader error specially
+		if err.Error() == "http: request body too large" {
+			h.writeError(w, http.StatusRequestEntityTooLarge, "Request body too large")
+			return
+		}
+		h.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -279,13 +311,22 @@ func generateExecutionID() string {
 	return "exec-" + randomString(16)
 }
 
+// randomString generates a cryptographically secure random string
+// of the specified length using crypto/rand
 func randomString(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[i%len(letters)]
+	bytes := make([]byte, n)
+
+	// Use crypto/rand for secure random generation
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback should never happen in practice, but handle gracefully
+		panic("crypto/rand.Read failed: " + err.Error())
 	}
-	return string(b)
+
+	for i := range bytes {
+		bytes[i] = letters[bytes[i]%byte(len(letters))]
+	}
+	return string(bytes)
 }
 
 func statusToString(status frontend.ExecutionStatus) string {

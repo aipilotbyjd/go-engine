@@ -2,8 +2,12 @@ package authn
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -120,15 +124,38 @@ func NewJWTValidator(config JWTConfig) (*JWTValidator, error) {
 }
 
 // Validate validates a JWT token and returns claims
+// Implements full signature verification for HMAC-SHA256 (HS256)
 func (v *JWTValidator) Validate(ctx context.Context, token string) (*Claims, error) {
-	// Parse token parts
+	// Parse token parts (header.payload.signature)
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil, ErrTokenMalformed
 	}
 
+	headerPart, payloadPart, signaturePart := parts[0], parts[1], parts[2]
+
+	// Decode and validate header
+	headerBytes, err := base64URLDecode(headerPart)
+	if err != nil {
+		return nil, ErrTokenMalformed
+	}
+
+	var header struct {
+		Alg string `json:"alg"`
+		Typ string `json:"typ"`
+		Kid string `json:"kid,omitempty"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, ErrTokenMalformed
+	}
+
+	// Verify signature based on algorithm
+	if err := v.verifySignature(header.Alg, headerPart+"."+payloadPart, signaturePart); err != nil {
+		return nil, err
+	}
+
 	// Decode payload
-	payloadBytes, err := base64URLDecode(parts[1])
+	payloadBytes, err := base64URLDecode(payloadPart)
 	if err != nil {
 		return nil, ErrTokenMalformed
 	}
@@ -138,48 +165,105 @@ func (v *JWTValidator) Validate(ctx context.Context, token string) (*Claims, err
 		return nil, ErrTokenMalformed
 	}
 
-	// Validate claims
+	// Validate expiration
 	if claims.IsExpired() {
 		return nil, ErrTokenExpired
 	}
 
+	// Validate not-before time
+	if claims.NotBefore > 0 && time.Now().Unix() < claims.NotBefore {
+		return nil, ErrTokenInvalid
+	}
+
+	// Validate issuer
 	if v.issuer != "" && claims.Issuer != v.issuer {
 		return nil, ErrTokenInvalid
 	}
 
+	// Validate audience
 	if v.audience != "" && !containsString(claims.Audience, v.audience) {
 		return nil, ErrTokenInvalid
 	}
 
-	// TODO: Validate signature
-	// This is a simplified implementation
-	// Production code should properly validate the signature
-
 	return &claims, nil
 }
 
+// verifySignature verifies the JWT signature based on the algorithm
+func (v *JWTValidator) verifySignature(alg, signatureInput, signaturePart string) error {
+	// Decode the provided signature
+	providedSig, err := base64URLDecode(signaturePart)
+	if err != nil {
+		return ErrSignatureInvalid
+	}
+
+	switch alg {
+	case "HS256":
+		if len(v.secretKey) == 0 {
+			return errors.New("HMAC secret key not configured")
+		}
+		expectedSig := v.computeHMAC256([]byte(signatureInput))
+		if !hmac.Equal(expectedSig, providedSig) {
+			return ErrSignatureInvalid
+		}
+
+	case "RS256":
+		if v.publicKey == nil {
+			return errors.New("RSA public key not configured")
+		}
+		// For RS256, we would verify using the public key
+		// This requires crypto/rsa.VerifyPKCS1v15
+		return errors.New("RS256 verification not yet implemented")
+
+	case "none":
+		// NEVER allow "none" algorithm - this is a common JWT attack vector
+		return errors.New("algorithm 'none' is not allowed")
+
+	default:
+		return fmt.Errorf("unsupported algorithm: %s", alg)
+	}
+
+	return nil
+}
+
+// computeHMAC256 computes HMAC-SHA256
+func (v *JWTValidator) computeHMAC256(data []byte) []byte {
+	h := hmac.New(sha256.New, v.secretKey)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
 // ExtractToken extracts JWT from request
+// SECURITY: Only extracts from Authorization header and secure cookies
+// Query parameter extraction has been removed as it's a security risk
 func ExtractToken(r *http.Request) (string, error) {
-	// Check Authorization header
+	// Check Authorization header (preferred method)
 	auth := r.Header.Get("Authorization")
 	if auth != "" {
 		parts := strings.SplitN(auth, " ", 2)
-		if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-			return parts[1], nil
+		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			token := strings.TrimSpace(parts[1])
+			if token != "" {
+				return token, nil
+			}
 		}
 	}
 
-	// Check cookie
-	cookie, err := r.Cookie("token")
-	if err == nil {
+	// Check HttpOnly cookie (for browser-based authentication)
+	// Note: Cookie should be set with HttpOnly, Secure, and SameSite flags
+	cookie, err := r.Cookie("__Host-token")
+	if err == nil && cookie.Value != "" {
 		return cookie.Value, nil
 	}
 
-	// Check query parameter (not recommended for production)
-	token := r.URL.Query().Get("token")
-	if token != "" {
-		return token, nil
+	// Fallback to legacy cookie name for backwards compatibility
+	cookie, err = r.Cookie("token")
+	if err == nil && cookie.Value != "" {
+		return cookie.Value, nil
 	}
+
+	// SECURITY: Query parameter token extraction has been intentionally removed
+	// Tokens in URLs can be logged, cached, leaked via Referer headers, and
+	// stored in browser history. This is a significant security risk.
 
 	return "", errors.New("no token found")
 }
@@ -273,22 +357,13 @@ func ExtractAPIKey(r *http.Request) (string, error) {
 
 // Helper functions
 
+// base64URLDecode decodes base64url-encoded data (RFC 4648)
+// This properly handles the URL-safe alphabet and missing padding
 func base64URLDecode(s string) ([]byte, error) {
-	// Add padding if needed
-	switch len(s) % 4 {
-	case 2:
-		s += "=="
-	case 3:
-		s += "="
-	}
-
-	// Replace URL-safe characters
-	s = strings.ReplaceAll(s, "-", "+")
-	s = strings.ReplaceAll(s, "_", "/")
-
-	// Use standard base64 decoding
-	// Note: This is simplified; production should use encoding/base64
-	return []byte(s), nil // Placeholder
+	// base64.RawURLEncoding handles URL-safe alphabet without padding
+	// We need to handle cases where padding might be present
+	s = strings.TrimRight(s, "=")
+	return base64.RawURLEncoding.DecodeString(s)
 }
 
 func containsString(slice []string, s string) bool {
@@ -300,7 +375,9 @@ func containsString(slice []string, s string) bool {
 	return false
 }
 
+// hashKey securely hashes an API key using SHA256
+// The hash is used for storage and comparison to avoid storing plaintext keys
 func hashKey(key string) string {
-	// TODO: Implement proper hashing
-	return key
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:])
 }

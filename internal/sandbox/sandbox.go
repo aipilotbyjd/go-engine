@@ -44,6 +44,16 @@ type ExecutionRequest struct {
 	Environment map[string]string
 }
 
+// sanitizedEnvVars returns a list of safe environment variable names
+// that can be passed to sandboxed processes
+var safeEnvVars = map[string]bool{
+	"PATH":   true,
+	"HOME":   true, // Often needed by runtimes
+	"TMPDIR": true,
+	"LANG":   true,
+	"LC_ALL": true,
+}
+
 // ExecutionResult represents the result of a sandboxed execution
 type ExecutionResult struct {
 	Output   map[string]interface{}
@@ -71,10 +81,14 @@ type Runtime interface {
 
 // Config holds sandbox configuration
 type Config struct {
-	Logger       *slog.Logger
-	WorkDir      string
-	EnableWASM   bool
-	EnableDocker bool
+	Logger                 *slog.Logger
+	WorkDir                string
+	EnableWASM             bool
+	EnableDocker           bool
+	AllowedEnvVars         []string      // Additional allowed env vars
+	MaxMemoryBytes         int64         // Default max memory (128MB)
+	MaxExecutionTime       time.Duration // Default max execution time (30s)
+	EnableNetworkIsolation bool          // Block network access in process mode
 }
 
 // NewSandbox creates a new sandbox
@@ -199,9 +213,9 @@ console.log(JSON.stringify({ __output: output }));
 	cmd := exec.CommandContext(ctx, "node", codeFile)
 	cmd.Dir = tmpDir
 
-	for k, v := range req.Environment {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	// SECURITY: Only pass explicitly allowed environment variables
+	// Never inherit the full parent environment
+	cmd.Env = buildSafeEnv(req.Environment)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -292,9 +306,8 @@ print(json.dumps({"__output": output}))
 	cmd := exec.CommandContext(ctx, pythonExec, codeFile)
 	cmd.Dir = tmpDir
 
-	for k, v := range req.Environment {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	// SECURITY: Only pass explicitly allowed environment variables
+	cmd.Env = buildSafeEnv(req.Environment)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -366,10 +379,22 @@ func (r *BashRuntime) Execute(ctx context.Context, req *ExecutionRequest) (*Exec
 	// Execute
 	cmd := exec.CommandContext(ctx, "bash", scriptFile)
 	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(), "INPUT_FILE="+inputFile)
 
+	// SECURITY: Create minimal environment for bash scripts
+	// Do NOT inherit os.Environ() as it may contain secrets
+	cmd.Env = []string{
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+		"HOME=" + tmpDir,
+		"TMPDIR=" + tmpDir,
+		"INPUT_FILE=" + inputFile,
+	}
+
+	// Add only explicitly requested environment variables (validated)
 	for k, v := range req.Environment {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		// Validate key to prevent injection
+		if isValidEnvKey(k) {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		}
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -441,13 +466,19 @@ func (r *ContainerRuntime) Execute(ctx context.Context, req *ExecutionRequest) (
 	inputJSON, _ := json.Marshal(req.Input)
 	os.WriteFile(inputFile, inputJSON, 0644)
 
-	// Build docker command
+	// Build docker command with security options
 	args := []string{
 		"run", "--rm",
 		"-v", fmt.Sprintf("%s:/workspace:ro", tmpDir),
 		"--memory", fmt.Sprintf("%d", req.MemoryLimit),
 		"--cpus", fmt.Sprintf("%.2f", req.CPULimit),
 		"--network", "none", // No network access
+		"--read-only",                              // Read-only root filesystem
+		"--security-opt", "no-new-privileges:true", // Prevent privilege escalation
+		"--cap-drop", "ALL", // Drop all capabilities
+		"--pids-limit", "100", // Limit process count
+		"--ulimit", "nofile=100:200", // Limit open files
+		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", // Writable /tmp with limits
 		r.image,
 	}
 	args = append(args, r.command...)
@@ -476,6 +507,74 @@ func (r *ContainerRuntime) Execute(ctx context.Context, req *ExecutionRequest) (
 }
 
 // Helpers
+
+// buildSafeEnv creates a minimal, safe environment for sandboxed processes
+// It only includes essential variables and explicitly requested ones
+func buildSafeEnv(requestedEnv map[string]string) []string {
+	env := []string{
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+		"HOME=/tmp",
+		"TMPDIR=/tmp",
+		"LANG=en_US.UTF-8",
+	}
+
+	// Add explicitly requested environment variables (validated)
+	for k, v := range requestedEnv {
+		if isValidEnvKey(k) {
+			env = append(env, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+
+	return env
+}
+
+// isValidEnvKey validates an environment variable key
+// Returns false for keys that could be used for injection attacks
+func isValidEnvKey(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	// Block common dangerous environment variables
+	dangerousVars := map[string]bool{
+		"LD_PRELOAD":      true, // Can inject shared libraries
+		"LD_LIBRARY_PATH": true, // Can redirect library loading
+		"PATH":            true, // Already set in safe env
+		"HOME":            true, // Already set in safe env
+		"SHELL":           true, // Could affect shell behavior
+		"IFS":             true, // Internal field separator - shell injection
+		"BASH_ENV":        true, // Executed before bash runs
+		"ENV":             true, // Similar to BASH_ENV
+		"PS1":             true, // Prompt - can contain commands
+		"PS2":             true,
+		"PS3":             true,
+		"PS4":             true,
+		"PROMPT_COMMAND":  true, // Executed before prompt
+		"CDPATH":          true, // Can affect cd behavior
+		"HISTFILE":        true, // History file location
+		"TERM":            true, // Terminal type
+	}
+
+	if dangerousVars[key] {
+		return false
+	}
+
+	// Only allow alphanumeric characters and underscores
+	// First character must be letter or underscore
+	for i, c := range key {
+		if i == 0 {
+			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+				return false
+			}
+		} else {
+			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+				return false
+			}
+		}
+	}
+
+	return true
+}
 
 func mustJSON(v interface{}) string {
 	data, _ := json.Marshal(v)

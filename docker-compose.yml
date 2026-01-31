@@ -9,8 +9,10 @@
 #   docker-compose logs -f                  # View logs
 #   docker-compose down                     # Stop all
 
-x-common-env: &common-env
-  DATABASE_URL: postgres://${POSTGRES_USER:-linkflow}:${POSTGRES_PASSWORD:-linkflow}@linkflow-postgres:5432/${POSTGRES_DB:-linkflow}?sslmode=disable
+x-common-env:
+  # SECURITY: SSL mode set to 'prefer' - upgrade to 'require' or 'verify-full' for production
+  &common-env
+  DATABASE_URL: postgres://${POSTGRES_USER:-linkflow}:${POSTGRES_PASSWORD:-linkflow}@linkflow-postgres:5432/${POSTGRES_DB:-linkflow}?sslmode=prefer
   REDIS_URL: redis://linkflow-redis:6379
   LOG_LEVEL: ${LOG_LEVEL:-info}
   LOG_FORMAT: json
@@ -49,8 +51,9 @@ services:
       HISTORY_ADDR: linkflow-history:7234
       MATCHING_ADDR: linkflow-matching:7235
       VISIBILITY_ADDR: linkflow-visibility:7237
-      # Auth
-      JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-change-in-production}
+      # Auth - SECURITY: These MUST be set via environment variables
+      # Generate a strong secret: openssl rand -base64 32
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET environment variable is required (min 32 chars)}
       # Rate limiting
       RATE_LIMIT_REQUESTS: 1000
       RATE_LIMIT_WINDOW: 60s
@@ -170,8 +173,10 @@ services:
       NUM_WORKERS: 4
       POLL_INTERVAL: 1s
       # Laravel callback (for hybrid mode)
+      # SECURITY: LINKFLOW_SECRET MUST be set via environment variable
+      # Generate a strong secret: openssl rand -base64 32
       CALLBACK_URL: http://linkflow-api:8000/api/v1/jobs/callback
-      CALLBACK_SECRET: ${LINKFLOW_SECRET:-your-shared-secret-change-in-production}
+      CALLBACK_SECRET: ${LINKFLOW_SECRET:?LINKFLOW_SECRET environment variable is required}
     healthcheck:
       test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8080/health" ]
       interval: 10s
@@ -337,7 +342,8 @@ services:
         SERVICE: worker
     container_name: linkflow-go-migrate
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-linkflow}:${POSTGRES_PASSWORD:-linkflow}@linkflow-postgres:5432/${POSTGRES_DB:-linkflow}?sslmode=disable
+      # SECURITY: Use SSL for production
+      DATABASE_URL: postgres://${POSTGRES_USER:-linkflow}:${POSTGRES_PASSWORD:-linkflow}@linkflow-postgres:5432/${POSTGRES_DB:-linkflow}?sslmode=prefer
     command: >
       sh -c "
         echo '🔄 Running Go Engine migrations...' &&
